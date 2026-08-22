@@ -156,8 +156,8 @@ Depth Anything 3 was installed from the official ByteDance-Seed repository at th
 ### 1. Clone this repository
 
 ```cmd
-git clone <YOUR-REPOSITORY-URL>
-cd <YOUR-REPOSITORY-FOLDER>
+git clone https://github.com/petermg/PhotoToPhysical
+cd PhotoToPhysical
 ```
 
 ### 2. Create a virtual environment
