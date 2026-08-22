@@ -1,0 +1,10 @@
+# Direct dependencies used by the custom Gradio application.
+# PyTorch / torchvision / xformers are intentionally installed separately
+# from the PyTorch CUDA 12.8 index; see INSTALL_WINDOWS_NVIDIA.txt.
+
+gradio==6.25.0
+numpy==1.26.4
+open3d==0.19.0
+opencv-python==4.11.0.86
+Pillow==12.3.0
+trimesh==5.0.0
