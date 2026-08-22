@@ -1,0 +1,217 @@
+DA3 DEPTH -> PRINTABLE 3D
+Windows + NVIDIA/CUDA installation guide
+=========================================
+
+This project is a standalone Gradio front-end that uses the official
+ByteDance Depth Anything 3 Python package.
+
+KNOWN-GOOD UPSTREAM DA3 REVISION
+--------------------------------
+Depth Anything 3 repository:
+https://github.com/ByteDance-Seed/Depth-Anything-3.git
+
+Pinned commit used by the working environment:
+3d835ec1a5802d64a8b8b15f817a1ab54809bfe4
+
+Do not silently track the latest DA3 commit if reproducibility matters.
+Install the pinned revision above, then update it deliberately later.
+
+
+PREREQUISITES
+-------------
+1. Windows 10/11
+2. NVIDIA GPU with a sufficiently recent NVIDIA driver
+3. Git for Windows
+4. Python 3.10+.
+   Python 3.11 is recommended for a fresh install.
+   NOTE: the exact Python version of the original working environment was
+   not recorded by pip freeze / pip list, so capture it separately with:
+       python --version
+
+The current application intentionally requires CUDA; it is not configured
+as a CPU-only application.
+
+You normally do NOT need to install the full CUDA Toolkit just to use the
+PyTorch CUDA wheel below. The PyTorch wheel supplies its CUDA runtime.
+A compatible NVIDIA display/compute driver is still required.
+
+
+RECOMMENDED REPOSITORY FILES
+----------------------------
+Keep these files in your own Git repository:
+
+    da3_print_gui_v2.py
+    requirements-app.txt
+    INSTALL_WINDOWS_NVIDIA.txt
+    .gitignore
+    README.md
+    LICENSE                 (license for YOUR code)
+    THIRD_PARTY_NOTICES.md  (recommended)
+
+Do NOT commit:
+
+    env/
+    .venv/
+    gradio_outputs/
+    __pycache__/
+    *.pyc
+    downloaded Hugging Face model weights/caches
+    generated OBJ/STL/GLB/EXR/PNG output jobs
+
+You also do NOT need to copy the complete Depth-Anything-3 source tree into
+your repository. The instructions below install the exact upstream revision
+as a Python package.
+
+
+FRESH INSTALL - WINDOWS CMD
+---------------------------
+From a normal Command Prompt:
+
+1. Clone YOUR repository:
+
+    git clone <YOUR-REPOSITORY-URL>
+    cd <YOUR-REPOSITORY-FOLDER>
+
+2. Create a virtual environment:
+
+    py -3.11 -m venv env
+
+3. Activate it:
+
+    env\Scripts\activate
+
+4. Upgrade packaging tools:
+
+    python -m pip install --upgrade pip setuptools wheel
+
+5. Install the same CUDA-enabled PyTorch family used by the working setup:
+
+    python -m pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cu128
+
+6. Install the matching xFormers version:
+
+    python -m pip install xformers==0.0.35 --index-url https://download.pytorch.org/whl/cu128
+
+7. Install the exact Depth Anything 3 revision used by the working setup:
+
+    python -m pip install "depth-anything-3 @ git+https://github.com/ByteDance-Seed/Depth-Anything-3.git@3d835ec1a5802d64a8b8b15f817a1ab54809bfe4"
+
+8. Install this application's pinned direct dependencies:
+
+    python -m pip install -r requirements-app.txt
+
+9. Verify CUDA and key imports:
+
+    python -c "import torch; print('PyTorch:', torch.__version__); print('CUDA runtime:', torch.version.cuda); print('CUDA available:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NONE')"
+
+    python -c "import gradio, cv2, trimesh, open3d, xformers; from depth_anything_3.api import DepthAnything3; print('All required imports OK')"
+
+10. Start the application:
+
+    python da3_print_gui_v2.py
+
+
+FRESH INSTALL - POWERSHELL ACTIVATION
+-------------------------------------
+If using PowerShell instead of CMD, the activation command is:
+
+    .\env\Scripts\Activate.ps1
+
+The remaining python / pip commands are the same.
+
+
+ALTERNATIVE: CLONE DA3 MANUALLY
+-------------------------------
+If you prefer to keep an actual checkout of the upstream DA3 source:
+
+    git clone https://github.com/ByteDance-Seed/Depth-Anything-3.git
+    cd Depth-Anything-3
+    git checkout 3d835ec1a5802d64a8b8b15f817a1ab54809bfe4
+    python -m pip install -e .
+
+If you use this manual-clone method, do not also install the Git URL form
+from step 7 above. Use ONE method or the other.
+
+Your custom Gradio script can live in your own repository; once DA3 is
+installed into the virtual environment, Python can import
+depth_anything_3 from anywhere.
+
+
+KNOWN-GOOD DIRECT PACKAGE VERSIONS
+----------------------------------
+These are the important direct versions observed in the working environment:
+
+    torch==2.10.0+cu128
+    torchvision==0.25.0+cu128
+    xformers==0.0.35
+    gradio==6.25.0
+    numpy==1.26.4
+    open3d==0.19.0
+    opencv-python==4.11.0.86
+    pillow==12.3.0
+    trimesh==5.0.0
+
+Depth Anything 3 itself was installed from:
+    https://github.com/ByteDance-Seed/Depth-Anything-3.git
+at commit:
+    3d835ec1a5802d64a8b8b15f817a1ab54809bfe4
+
+
+FIRST RUN / MODEL DOWNLOADS
+---------------------------
+The application downloads model weights from Hugging Face when a model is
+used for the first time. Internet access is therefore required for the first
+load of each model unless its Hugging Face cache is already populated.
+
+Models currently used by the GUI include:
+
+    depth-anything/DA3MONO-LARGE
+    depth-anything/DA3-LARGE-1.1
+    depth-anything/DA3-GIANT-1.1
+
+Model weights are NOT part of this repository.
+
+
+IMPORTANT MODEL-LICENSE NOTE
+----------------------------
+The upstream DA3 code is Apache-2.0, but individual model checkpoints do
+not all use the same license.
+
+At the time these instructions were written:
+- DA3MONO-LARGE is listed by the upstream project as Apache-2.0.
+- DA3-LARGE-1.1 and DA3-GIANT-1.1 are listed as CC BY-NC 4.0.
+
+If you redistribute model weights or use this project commercially, review
+the current license for each specific model checkpoint first.
+
+
+OUTPUTS
+-------
+By default the application writes generated jobs under:
+
+    gradio_outputs/
+
+This directory should normally be in .gitignore.
+
+
+REPRODUCIBILITY / TROUBLESHOOTING
+---------------------------------
+If someone reports that the application behaves differently, collect:
+
+    python --version
+    python -m pip freeze
+    git --version
+    nvidia-smi
+
+and run:
+
+    python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)"
+
+The original working environment reported:
+    PyTorch 2.10.0+cu128
+    torchvision 0.25.0+cu128
+    xformers 0.0.35
+    NVIDIA CUDA available
+
+The exact Python interpreter version should still be captured separately
+before publishing the repository if you want an exact environment record.

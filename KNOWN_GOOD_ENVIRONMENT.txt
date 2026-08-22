@@ -1,0 +1,26 @@
+KNOWN-GOOD ENVIRONMENT SNAPSHOT
+===============================
+
+Python:
+    Python 3.10.6
+
+Depth Anything 3:
+    Repository: https://github.com/ByteDance-Seed/Depth-Anything-3.git
+    Commit: 3d835ec1a5802d64a8b8b15f817a1ab54809bfe4
+
+CUDA / PyTorch stack:
+    torch==2.10.0+cu128
+    torchvision==0.25.0+cu128
+    xformers==0.0.35
+
+Application dependencies:
+    gradio==6.25.0
+    numpy==1.26.4
+    open3d==0.19.0
+    opencv-python==4.11.0.86
+    Pillow==12.3.0
+    trimesh==5.0.0
+
+The full observed environment is available from the accompanying
+pip freeze / pip list captures if an exact transitive dependency snapshot
+is needed for troubleshooting.
