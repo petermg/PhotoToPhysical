@@ -75,38 +75,46 @@ A Windows/NVIDIA Gradio application for turning Depth Anything 3 depth estimates
 
 ### Multi-image / multi-view 3D reconstruction
 
-- Accepts multiple overlapping images of the same subject or scene
-- Particularly useful for:
-  - ordered frames extracted from a video
-  - a camera orbit around a stationary subject
-  - overlapping photographs of a scene
+- Four input modes:
+  - unordered uploaded photographs
+  - naturally sorted ordered image/frame sequences
+  - direct video input with automatic frame extraction
+  - local COLMAP datasets with known camera intrinsics/extrinsics
+- Direct video sampling defaults to **1 FPS**, matching DA3's documented CLI default
+- Deterministic natural filename sorting for ordered frame sets (`frame2` before `frame10`)
+- Optional view cap with an **18-view default**, matching DA3's documented 2–18-view training regime at the 504 base resolution; larger sets are sampled evenly
 - Multi-view model choices:
   - `depth-anything/DA3-GIANT-1.1`
+  - `depth-anything/DA3NESTED-GIANT-LARGE-1.1`
   - `depth-anything/DA3-LARGE-1.1`
 - DA3 multi-view processing-resolution presets, with **504** as the recommended starting point
-- Reference-view strategies:
-  - `saddle_balanced` for general unordered photos
-  - `saddle_sim_range` for wider-baseline photo sets
+- **High-quality ray-based pose estimation** enabled by default for pose-free input (`use_ray_pose=True`)
+- Fast camera-decoder pose estimation remains available by disabling ray pose
+- Automatic reference-view selection by input type:
   - `middle` for ordered sequences / video frames
+  - `saddle_balanced` for general unordered photos
+- Manual reference-view strategies remain available:
+  - `saddle_balanced`
+  - `saddle_sim_range`
+  - `middle`
+  - `first`
+- **COLMAP pose-conditioned depth** mode using DA3's own COLMAP loader
+- Optional alignment of DA3 depth to known COLMAP camera scale
 - Configurable DA3 confidence filtering
-- Configurable maximum fused point count
+- Configurable maximum GLB point count
 - DA3 fused `scene.glb` export
-- Correct application of GLB scene-graph transforms when extracting world-space geometry
-- Raw fused point-cloud export
-- Statistical point-cloud outlier cleanup
-- Optional voxel downsampling
-- Normal estimation / orientation before reconstruction
-- Poisson surface reconstruction
-- Adjustable Poisson reconstruction depth
-- Optional low-density surface trimming
-- Adjustable Taubin smoothing
-- Optional triangle-count reduction / decimation
-- Option to keep only the largest connected mesh component
-- Multi-view mesh export as:
-  - `.obj`
-  - `.stl`
-  - `.ply`
-- Dedicated neutral, rough, double-sided **GLB preview** for more faithful browser rendering
+- Raw DA3 reconstruction arrays (`depth`, confidence, intrinsics, extrinsics, sky) saved for inspection/reproducibility
+- Camera-pose diagnostic GLB showing DA3's point cloud plus camera centers and forward directions
+- Camera matrices saved to JSON
+- Input-order manifest showing the exact image sequence sent to DA3
+- **TSDF fusion (recommended)** that directly integrates DA3 depth maps, confidence, intrinsics, and extrinsics
+- Configurable TSDF voxel detail, signed-distance truncation, and far-depth outlier percentile
+- Automatic DA3 sky masking when available
+- Existing **Poisson surface reconstruction** retained as an alternate method
+- Controlled **A/B: TSDF + Poisson** mode that runs both meshers from the exact same DA3 inference
+- Poisson point-cloud voxel downsampling, normal estimation/orientation, reconstruction depth, and density trimming controls
+- Shared Taubin smoothing, triangle-count reduction/decimation, and largest-component cleanup
+- Multi-view mesh export as `.obj`, `.stl`, `.ply`, plus neutral double-sided preview `.glb` files
 - Multi-view metadata, quality statistics, watertightness reporting, and downloadable ZIP package
 
 ### GUI / workflow conveniences
@@ -156,8 +164,8 @@ Depth Anything 3 was installed from the official ByteDance-Seed repository at th
 ### 1. Clone this repository
 
 ```cmd
-git clone https://github.com/petermg/PhotoToPhysical
-cd PhotoToPhysical
+git clone <YOUR-REPOSITORY-URL>
+cd <YOUR-REPOSITORY-FOLDER>
 ```
 
 ### 2. Create a virtual environment
@@ -373,36 +381,59 @@ The larger DA3 any-view models are the appropriate models for this workflow:
 ```text
 depth-anything/DA3-LARGE-1.1
 depth-anything/DA3-GIANT-1.1
+depth-anything/DA3NESTED-GIANT-LARGE-1.1
 ```
 
-For video frames, the `middle` reference strategy is a good starting point.
-
-For unordered photos, use an appropriate general multi-view reference strategy.
-
-A recommended first test for DA3 Large/Giant is:
+A recommended first quality test is:
 
 ```text
+Model: DA3-GIANT-1.1
 Process resolution: 504
+Ray pose: ON
+Reconstruction: TSDF
+Confidence percentile: 40
 ```
 
-Higher processing resolution is not automatically better for these models.
+For ordered frames and direct video input, the app automatically uses DA3's `middle` reference strategy by default. For unordered photo sets it uses `saddle_balanced`. You can disable automatic reference selection and manually choose `saddle_balanced`, `saddle_sim_range`, `middle`, or `first`.
 
-The multi-image path generates DA3 multi-view geometry and converts the resulting point cloud into a triangle mesh using Open3D.
+Direct video input defaults to **1 FPS**, matching the upstream DA3 CLI. The app also defaults to a maximum of 18 selected views and evenly samples larger sequences.
+
+Higher processing resolution is not automatically better for these models. Start at **504** before experimenting with 756 or 1008.
+
+## Ray pose and known camera poses
+
+For pose-free images, **ray-based pose estimation** is enabled by default. DA3 documents this mode as somewhat slower but generally more accurate than the camera decoder. Disable it when you specifically want the faster camera-head path for comparison.
+
+For maximum control, choose **COLMAP local dataset (known poses)** and point the GUI at a standard COLMAP directory containing `images/` and `sparse/`. The app uses DA3's own COLMAP loader and supplies those intrinsics/extrinsics to DA3 for pose-conditioned depth estimation.
+
+## TSDF vs Poisson
+
+**TSDF is now the recommended reconstruction method.** It integrates DA3's organized depth maps together with confidence, camera intrinsics, and world-to-camera extrinsics. This preserves the camera-ray structure that is discarded when depth is first flattened into a generic point cloud.
+
+Poisson reconstruction is still included because it can work well on some point clouds and provides a valuable comparison. Select **A/B: TSDF + Poisson** to run both methods from one DA3 inference. The app produces separate meshes/previews and reports geometry statistics for both.
 
 ## Multi-image quality controls
 
 The UI exposes controls for:
 
+- direct-video sampling FPS
+- maximum view count
+- ray-pose quality mode
+- automatic/manual reference-view strategy
+- COLMAP scale alignment
 - DA3 confidence-filter percentile
-- maximum fused point count
-- voxel downsampling
+- maximum GLB point count
+- TSDF voxel detail
+- TSDF signed-distance truncation
+- TSDF far-depth truncation percentile
+- Poisson point-cloud voxel downsampling
 - Poisson reconstruction depth
-- low-density vertex trimming
+- low-density Poisson trimming
 - Taubin smoothing iterations
 - target triangle count / full-resolution output
 - keeping only the largest connected component
 
-The app also saves DA3's fused `scene.glb` and the raw point cloud so the DA3 reconstruction can be inspected separately from the generated surface mesh.
+The app saves `scene.glb`, DA3's raw reconstruction arrays, exact input order, camera matrices, and `camera_pose_diagnostic.glb`. The diagnostic GLB is particularly useful for deciding whether a bad mesh originates in DA3's estimated camera path or in the selected surface-reconstruction method.
 
 ---
 
@@ -444,12 +475,28 @@ albedo.png
 mesh_metadata.json
 depth_metadata.json
 
-multiview_da3_export/scene.glb
-multiview_point_cloud_raw.ply
+da3_multiview/scene.glb
+da3_prediction_for_reconstruction.npz
+multiview_input_order.txt
+camera_poses.json
+camera_pose_diagnostic.glb
+
 multiview_mesh.obj
 multiview_mesh.stl
 multiview_mesh.ply
 multiview_mesh_preview.glb
+
+# In A/B mode:
+multiview_tsdf.obj
+multiview_tsdf.stl
+multiview_tsdf.ply
+multiview_tsdf_preview.glb
+multiview_tsdf_surface_point_cloud.ply
+multiview_poisson.obj
+multiview_poisson.stl
+multiview_poisson.ply
+multiview_poisson_preview.glb
+multiview_poisson_point_cloud_raw.ply
 multiview_metadata.json
 ```
 

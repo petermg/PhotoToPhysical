@@ -168,6 +168,7 @@ Models currently used by the GUI include:
     depth-anything/DA3MONO-LARGE
     depth-anything/DA3-LARGE-1.1
     depth-anything/DA3-GIANT-1.1
+    depth-anything/DA3NESTED-GIANT-LARGE-1.1
 
 Model weights are NOT part of this repository.
 
@@ -179,7 +180,7 @@ not all use the same license.
 
 At the time these instructions were written:
 - DA3MONO-LARGE is listed by the upstream project as Apache-2.0.
-- DA3-LARGE-1.1 and DA3-GIANT-1.1 are listed as CC BY-NC 4.0.
+- DA3-LARGE-1.1, DA3-GIANT-1.1, and DA3NESTED-GIANT-LARGE-1.1 are listed as CC BY-NC 4.0.
 
 If you redistribute model weights or use this project commercially, review
 the current license for each specific model checkpoint first.

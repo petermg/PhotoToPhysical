@@ -15,6 +15,7 @@ model table at the time this notice was prepared:
 - depth-anything/DA3MONO-LARGE: Apache-2.0
 - depth-anything/DA3-LARGE-1.1: CC BY-NC 4.0
 - depth-anything/DA3-GIANT-1.1: CC BY-NC 4.0
+- depth-anything/DA3NESTED-GIANT-LARGE-1.1: CC BY-NC 4.0
 
 This repository should not redistribute those model weights unless their
 individual license terms are satisfied. The application downloads models

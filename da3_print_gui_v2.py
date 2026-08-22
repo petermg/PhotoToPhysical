@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import time
 import uuid
@@ -43,6 +44,7 @@ MODEL_CHOICES = [
     ("DA3Mono-Large (recommended monocular)", "depth-anything/DA3MONO-LARGE"),
     ("DA3-Large-1.1 (any-view large)", "depth-anything/DA3-LARGE-1.1"),
     ("DA3-Giant-1.1 (any-view giant)", "depth-anything/DA3-GIANT-1.1"),
+    ("DA3Nested-Giant-Large-1.1 (metric any-view)", "depth-anything/DA3NESTED-GIANT-LARGE-1.1"),
 ]
 MODEL_ID_TO_LABEL = {value: label for label, value in MODEL_CHOICES}
 APP_ROOT = Path(__file__).resolve().parent
@@ -822,6 +824,13 @@ def zip_job(job_dir: Path) -> Path:
 # Multi-view DA3 reconstruction
 # ---------------------------------------------------------------------
 
+MULTIVIEW_MODEL_IDS = {
+    "depth-anything/DA3-LARGE-1.1",
+    "depth-anything/DA3-GIANT-1.1",
+    "depth-anything/DA3NESTED-GIANT-LARGE-1.1",
+}
+
+
 def collect_uploaded_files(file_list) -> list[Path]:
     """Resolve a Gradio multi-file upload into local Paths."""
     if not file_list:
@@ -850,6 +859,223 @@ def collect_uploaded_files(file_list) -> list[Path]:
         raise TypeError(f"Unsupported uploaded file type: {type(item)}")
 
     return result
+
+
+def natural_sort_key(value) -> list:
+    """Human/natural filename ordering: frame2 comes before frame10."""
+    name = Path(value).name.casefold()
+    return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", name)]
+
+
+def evenly_spaced_indices(count: int, maximum: int) -> list[int]:
+    """Choose deterministic, evenly spaced samples while retaining endpoints."""
+    if maximum <= 0 or count <= maximum:
+        return list(range(count))
+    if maximum == 1:
+        return [count // 2]
+
+    raw = np.linspace(0, count - 1, maximum)
+    indices = np.rint(raw).astype(int).tolist()
+
+    # np.rint can theoretically duplicate indices for small arrays; preserve order.
+    deduped = []
+    seen = set()
+    for idx in indices:
+        if idx not in seen:
+            deduped.append(idx)
+            seen.add(idx)
+
+    # Fill any lost slots deterministically.
+    if len(deduped) < maximum:
+        for idx in range(count):
+            if idx not in seen:
+                deduped.append(idx)
+                seen.add(idx)
+                if len(deduped) >= maximum:
+                    break
+        deduped.sort()
+
+    return deduped
+
+
+def _copy_ordered_inputs(
+    source_paths: list[Path],
+    input_dir: Path,
+) -> list[Path]:
+    copied = []
+    input_dir.mkdir(parents=True, exist_ok=True)
+
+    for index, src in enumerate(source_paths):
+        src = Path(src)
+        if not src.exists():
+            raise FileNotFoundError(f"Input image not found: {src}")
+
+        suffix = src.suffix.lower() or ".png"
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", src.stem)[:80]
+        dst = input_dir / f"{index:03d}_{safe_name}{suffix}"
+        shutil.copy2(src, dst)
+        copied.append(dst)
+
+    return copied
+
+
+def prepare_multiview_inputs(
+    input_mode: str,
+    multi_image_files,
+    video_file,
+    video_sample_fps: float,
+    colmap_dir_path: str,
+    colmap_sparse_subdir: str,
+    max_views: int,
+    job_dir: Path,
+):
+    """
+    Prepare DA3 inputs in deterministic order.
+
+    Returns:
+        copied_images, input_extrinsics, input_intrinsics, source_kind, metadata
+    """
+    input_dir = job_dir / "multiview_inputs"
+    input_dir.mkdir(parents=True, exist_ok=True)
+
+    input_extrinsics = None
+    input_intrinsics = None
+    source_meta = {"input_mode": str(input_mode)}
+
+    if input_mode == "Video file":
+        if not video_file:
+            raise ValueError("Choose a video file first.")
+        if float(video_sample_fps) <= 0:
+            raise ValueError("Video sampling FPS must be greater than zero.")
+
+        video_paths = collect_uploaded_files([video_file])
+        if not video_paths:
+            raise ValueError("Could not resolve the uploaded video file.")
+        video_path = video_paths[0]
+
+        # Use DA3's own VideoHandler so sampling behavior matches the pinned
+        # upstream CLI: requested FPS -> frame interval -> sorted extracted files.
+        try:
+            from depth_anything_3.services.input_handlers import VideoHandler
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not import DA3's official VideoHandler from the installed "
+                "Depth Anything 3 package."
+            ) from exc
+
+        extract_root = job_dir / "video_extract"
+        extracted = [
+            Path(p)
+            for p in VideoHandler.process(
+                str(video_path),
+                str(extract_root),
+                float(video_sample_fps),
+            )
+        ]
+        extracted = sorted(extracted, key=natural_sort_key)
+
+        indices = evenly_spaced_indices(len(extracted), int(max_views))
+        selected = [extracted[i] for i in indices]
+        copied_images = _copy_ordered_inputs(selected, input_dir)
+        # Keep the job ZIP focused on the actual inference views rather than
+        # every intermediate frame extracted from a long video.
+        shutil.rmtree(extract_root, ignore_errors=True)
+
+        source_meta.update(
+            {
+                "video_file": video_path.name,
+                "requested_sample_fps": float(video_sample_fps),
+                "frames_extracted": len(extracted),
+                "frames_selected": len(selected),
+                "selected_frame_names": [p.name for p in selected],
+            }
+        )
+        source_kind = "video"
+
+    elif input_mode == "COLMAP local dataset (known poses)":
+        colmap_raw = str(colmap_dir_path or "").strip().strip('"')
+        if not colmap_raw:
+            raise ValueError(
+                "Enter a local COLMAP dataset folder containing images/ and sparse/."
+            )
+        colmap_root = Path(colmap_raw)
+        if not colmap_root.exists():
+            raise ValueError(
+                "Enter a valid local COLMAP dataset folder containing images/ and sparse/."
+            )
+
+        try:
+            from depth_anything_3.services.input_handlers import ColmapHandler
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not import DA3's official ColmapHandler from the installed "
+                "Depth Anything 3 package."
+            ) from exc
+
+        image_files, extrinsics, intrinsics = ColmapHandler.process(
+            str(colmap_root),
+            str(colmap_sparse_subdir or "").strip(),
+        )
+
+        records = list(zip(image_files, extrinsics, intrinsics))
+        records.sort(key=lambda item: natural_sort_key(item[0]))
+
+        indices = evenly_spaced_indices(len(records), int(max_views))
+        selected = [records[i] for i in indices]
+
+        source_paths = [Path(item[0]) for item in selected]
+        input_extrinsics = np.asarray([item[1] for item in selected], dtype=np.float32)
+        input_intrinsics = np.asarray([item[2] for item in selected], dtype=np.float32)
+        copied_images = _copy_ordered_inputs(source_paths, input_dir)
+
+        source_meta.update(
+            {
+                "colmap_dir": str(colmap_root),
+                "sparse_subdir": str(colmap_sparse_subdir or ""),
+                "colmap_views_available": len(records),
+                "views_selected": len(selected),
+                "known_poses_supplied": True,
+            }
+        )
+        source_kind = "colmap"
+
+    else:
+        image_paths = collect_uploaded_files(multi_image_files)
+        if len(image_paths) < 2:
+            raise ValueError(
+                "Upload at least 2 images of the same subject/scene for multi-view reconstruction."
+            )
+
+        # Deterministic natural ordering is important for ordered frame sequences,
+        # and harmless/reproducible for unordered photo collections.
+        image_paths = sorted(image_paths, key=natural_sort_key)
+        indices = evenly_spaced_indices(len(image_paths), int(max_views))
+        selected = [image_paths[i] for i in indices]
+        copied_images = _copy_ordered_inputs(selected, input_dir)
+
+        source_kind = (
+            "ordered_frames"
+            if input_mode == "Ordered uploaded frames"
+            else "unordered_photos"
+        )
+        source_meta.update(
+            {
+                "uploaded_images": len(image_paths),
+                "views_selected": len(selected),
+                "selected_original_names": [p.name for p in selected],
+            }
+        )
+
+    if len(copied_images) < 2:
+        raise ValueError("At least 2 usable views are required after input selection.")
+
+    return (
+        copied_images,
+        input_extrinsics,
+        input_intrinsics,
+        source_kind,
+        source_meta,
+    )
 
 
 def extract_transformed_points_from_glb(glb_path: Path):
@@ -913,6 +1139,173 @@ def extract_transformed_points_from_glb(glb_path: Path):
     )
 
 
+def _to_4x4_extrinsic(extrinsic) -> np.ndarray:
+    ext = np.asarray(extrinsic, dtype=np.float64)
+    if ext.shape == (4, 4):
+        return ext
+    if ext.shape == (3, 4):
+        out = np.eye(4, dtype=np.float64)
+        out[:3, :] = ext
+        return out
+    raise ValueError(f"Expected 3x4 or 4x4 extrinsic, got {ext.shape}")
+
+
+def create_camera_diagnostic_glb(
+    prediction,
+    output_dir: Path,
+    conf_thresh_percentile: float,
+    num_max_points: int,
+):
+    """
+    Export an official DA3 diagnostic GLB with camera wireframes enabled.
+
+    Using DA3's exporter here is important because its GLB path performs scene
+    scale normalization; exporting the points and cameras together keeps them in
+    the exact same display coordinate system.
+    """
+    diag_json = output_dir / "camera_poses.json"
+
+    extrinsics = getattr(prediction, "extrinsics", None)
+    intrinsics = getattr(prediction, "intrinsics", None)
+
+    if extrinsics is not None:
+        exts = np.asarray(extrinsics, dtype=np.float64)
+        ixts = None if intrinsics is None else np.asarray(intrinsics, dtype=np.float64)
+        records = []
+        for idx, ext in enumerate(exts):
+            ext4 = _to_4x4_extrinsic(ext)
+            c2w = np.linalg.inv(ext4)
+            records.append(
+                {
+                    "index": idx,
+                    "world_to_camera": ext4.tolist(),
+                    "camera_to_world": c2w.tolist(),
+                    "camera_center_world": c2w[:3, 3].tolist(),
+                    "intrinsics": (
+                        ixts[idx].tolist()
+                        if ixts is not None and idx < len(ixts)
+                        else None
+                    ),
+                }
+            )
+        diag_json.write_text(
+            json.dumps({"cameras": records}, indent=2),
+            encoding="utf-8",
+        )
+    else:
+        diag_json = None
+
+    diag_dir = output_dir / "da3_camera_diagnostic"
+    diag_dir.mkdir(parents=True, exist_ok=True)
+    diag_glb = None
+
+    try:
+        from depth_anything_3.utils.export import export as da3_export
+
+        da3_export(
+            prediction,
+            "glb",
+            str(diag_dir),
+            glb={
+                "conf_thresh_percentile": float(conf_thresh_percentile),
+                "num_max_points": int(num_max_points),
+                "show_cameras": True,
+            },
+        )
+
+        candidates = list(diag_dir.rglob("*.glb"))
+        if candidates:
+            diag_glb = output_dir / "camera_pose_diagnostic.glb"
+            shutil.copy2(candidates[0], diag_glb)
+    except Exception as exc:
+        print(f"WARNING: Could not create official DA3 camera diagnostic GLB: {exc}")
+
+    return diag_glb, diag_json
+
+def _cleanup_open3d_mesh(
+    mesh,
+    keep_largest_component: bool,
+    smooth_iterations: int,
+    target_faces: int,
+):
+    mesh.remove_degenerate_triangles()
+    mesh.remove_duplicated_triangles()
+    mesh.remove_duplicated_vertices()
+    mesh.remove_unreferenced_vertices()
+
+    if bool(keep_largest_component) and len(mesh.triangles) > 0:
+        triangle_clusters, cluster_n_triangles, _ = mesh.cluster_connected_triangles()
+        triangle_clusters = np.asarray(triangle_clusters)
+        cluster_n_triangles = np.asarray(cluster_n_triangles)
+
+        if len(cluster_n_triangles) > 1:
+            largest_cluster = int(np.argmax(cluster_n_triangles))
+            mesh.remove_triangles_by_mask(triangle_clusters != largest_cluster)
+            mesh.remove_unreferenced_vertices()
+
+    if int(smooth_iterations) > 0 and len(mesh.vertices) > 0:
+        mesh = mesh.filter_smooth_taubin(
+            number_of_iterations=int(smooth_iterations)
+        )
+
+    if int(target_faces) > 0 and len(mesh.triangles) > int(target_faces):
+        mesh = mesh.simplify_quadric_decimation(int(target_faces))
+        mesh.remove_degenerate_triangles()
+        mesh.remove_duplicated_triangles()
+        mesh.remove_duplicated_vertices()
+        mesh.remove_unreferenced_vertices()
+
+    mesh.compute_vertex_normals()
+    return mesh
+
+
+def _export_open3d_mesh_bundle(mesh, output_dir: Path, prefix: str):
+    try:
+        import open3d as o3d
+    except ImportError as exc:
+        raise RuntimeError("Open3D is required for multi-view meshing.") from exc
+
+    obj_path = output_dir / f"{prefix}.obj"
+    stl_path = output_dir / f"{prefix}.stl"
+    ply_path = output_dir / f"{prefix}.ply"
+    preview_glb_path = output_dir / f"{prefix}_preview.glb"
+
+    o3d.io.write_triangle_mesh(str(obj_path), mesh, write_vertex_colors=True)
+    o3d.io.write_triangle_mesh(str(stl_path), mesh)
+    o3d.io.write_triangle_mesh(str(ply_path), mesh, write_vertex_colors=True)
+
+    mesh_tm = trimesh.Trimesh(
+        vertices=np.asarray(mesh.vertices),
+        faces=np.asarray(mesh.triangles),
+        process=False,
+    )
+    try:
+        mesh_tm.fix_normals(multibody=True)
+    except Exception:
+        pass
+
+    preview_material = trimesh.visual.material.PBRMaterial(
+        name="neutral_preview",
+        baseColorFactor=[125, 125, 125, 255],
+        metallicFactor=0.0,
+        roughnessFactor=0.9,
+        doubleSided=True,
+    )
+    mesh_tm.visual = trimesh.visual.TextureVisuals(material=preview_material)
+    trimesh.Scene(mesh_tm).export(preview_glb_path)
+
+    return {
+        "obj_path": obj_path,
+        "stl_path": stl_path,
+        "ply_path": ply_path,
+        "preview_glb_path": preview_glb_path,
+        "vertices": int(len(mesh.vertices)),
+        "triangles": int(len(mesh.triangles)),
+        "watertight": bool(mesh_tm.is_watertight),
+        "euler_number": int(mesh_tm.euler_number),
+    }
+
+
 def reconstruct_poisson_mesh(
     glb_path: Path,
     output_dir: Path,
@@ -922,8 +1315,9 @@ def reconstruct_poisson_mesh(
     smooth_iterations: int,
     target_faces: int,
     keep_largest_component: bool,
+    prefix: str = "multiview_poisson",
 ):
-    """Convert DA3's fused multi-view point cloud into a surface mesh."""
+    """Convert DA3's fused GLB point cloud into a Poisson surface."""
     try:
         import open3d as o3d
     except ImportError as exc:
@@ -938,19 +1332,15 @@ def reconstruct_poisson_mesh(
     pcd.points = o3d.utility.Vector3dVector(points)
     pcd.colors = o3d.utility.Vector3dVector(colors)
 
-    raw_ply_path = output_dir / "multiview_point_cloud_raw.ply"
+    raw_ply_path = output_dir / f"{prefix}_point_cloud_raw.ply"
     o3d.io.write_point_cloud(str(raw_ply_path), pcd)
 
-    # Optional downsampling. 0 means preserve all DA3-exported points.
     if float(voxel_size) > 0.0:
         pcd = pcd.voxel_down_sample(float(voxel_size))
 
     if len(pcd.points) < 100:
-        raise RuntimeError(
-            "Too few valid points remained for surface reconstruction."
-        )
+        raise RuntimeError("Too few valid points remained for Poisson reconstruction.")
 
-    # Reject isolated point-cloud noise before meshing.
     if len(pcd.points) >= 1000:
         pcd, _ = pcd.remove_statistical_outlier(
             nb_neighbors=20,
@@ -961,13 +1351,9 @@ def reconstruct_poisson_mesh(
         search_param=o3d.geometry.KDTreeSearchParamKNN(knn=30)
     )
 
-    # Multi-view clouds do not have a single useful camera direction for
-    # normal orientation, so orient normals consistently across the surface.
     try:
         pcd.orient_normals_consistent_tangent_plane(30)
     except RuntimeError:
-        # Some sparse/degenerate clouds may not support tangent-plane
-        # orientation. Poisson can still be attempted with estimated normals.
         pass
 
     mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
@@ -979,107 +1365,268 @@ def reconstruct_poisson_mesh(
     if len(densities) == 0 or len(mesh.vertices) == 0:
         raise RuntimeError("Poisson reconstruction produced an empty mesh.")
 
-    # Optional low-density trimming. Keep this at 0 when watertightness is
-    # more important than removing weak Poisson 'skirts'.
     if float(trim_percentile) > 0.0:
         threshold = np.percentile(densities, float(trim_percentile))
         mesh.remove_vertices_by_mask(densities < threshold)
 
-    mesh.remove_degenerate_triangles()
-    mesh.remove_duplicated_triangles()
-    mesh.remove_duplicated_vertices()
-    mesh.remove_unreferenced_vertices()
+    mesh = _cleanup_open3d_mesh(
+        mesh,
+        keep_largest_component=bool(keep_largest_component),
+        smooth_iterations=int(smooth_iterations),
+        target_faces=int(target_faces),
+    )
 
-    # Remove disconnected islands while preserving the dominant reconstruction.
-    if bool(keep_largest_component) and len(mesh.triangles) > 0:
-        triangle_clusters, cluster_n_triangles, _ = mesh.cluster_connected_triangles()
-        triangle_clusters = np.asarray(triangle_clusters)
-        cluster_n_triangles = np.asarray(cluster_n_triangles)
+    exported = _export_open3d_mesh_bundle(mesh, output_dir, prefix)
+    exported.update(
+        {
+            "raw_ply_path": raw_ply_path,
+            "input_points": int(len(points)),
+            "filtered_points": int(len(pcd.points)),
+            "method": "Poisson",
+        }
+    )
+    return exported
 
-        if len(cluster_n_triangles) > 1:
-            largest_cluster = int(np.argmax(cluster_n_triangles))
-            mesh.remove_triangles_by_mask(triangle_clusters != largest_cluster)
-            mesh.remove_unreferenced_vertices()
 
-    if int(smooth_iterations) > 0:
-        mesh = mesh.filter_smooth_taubin(
-            number_of_iterations=int(smooth_iterations)
+def _prediction_confidence_mask(prediction, percentile: float):
+    depth = np.asarray(prediction.depth, dtype=np.float32)
+    base_valid = np.isfinite(depth) & (depth > 0)
+
+    sky = getattr(prediction, "sky", None)
+    if sky is not None:
+        sky_arr = np.asarray(sky, dtype=bool)
+        if sky_arr.shape == depth.shape:
+            base_valid &= ~sky_arr
+
+    conf = getattr(prediction, "conf", None)
+    threshold = None
+    if conf is not None:
+        conf_arr = np.asarray(conf, dtype=np.float32)
+        if conf_arr.shape == depth.shape:
+            conf_values = conf_arr[base_valid & np.isfinite(conf_arr)]
+            if len(conf_values):
+                threshold = float(np.percentile(conf_values, float(percentile)))
+                base_valid &= np.isfinite(conf_arr) & (conf_arr >= threshold)
+
+    return base_valid, threshold
+
+
+def reconstruct_tsdf_mesh(
+    prediction,
+    output_dir: Path,
+    conf_thresh_percentile: float,
+    tsdf_voxels_per_median_depth: int,
+    tsdf_truncation_voxels: float,
+    tsdf_depth_trunc_percentile: float,
+    smooth_iterations: int,
+    target_faces: int,
+    keep_largest_component: bool,
+    prefix: str = "multiview_tsdf",
+):
+    """
+    Fuse DA3's organized depth maps + intrinsics + world-to-camera poses directly
+    into an Open3D scalable TSDF volume, then extract a triangle mesh.
+    """
+    try:
+        import open3d as o3d
+    except ImportError as exc:
+        raise RuntimeError(
+            "TSDF reconstruction requires Open3D. Install it with: pip install open3d"
+        ) from exc
+
+    depth = np.asarray(prediction.depth, dtype=np.float32)
+    colors = np.asarray(prediction.processed_images)
+    extrinsics = getattr(prediction, "extrinsics", None)
+    intrinsics = getattr(prediction, "intrinsics", None)
+
+    if extrinsics is None or intrinsics is None:
+        raise RuntimeError(
+            "DA3 did not return camera intrinsics/extrinsics, so TSDF fusion cannot run."
         )
 
-    if int(target_faces) > 0 and len(mesh.triangles) > int(target_faces):
-        mesh = mesh.simplify_quadric_decimation(int(target_faces))
-        mesh.remove_degenerate_triangles()
-        mesh.remove_duplicated_triangles()
-        mesh.remove_duplicated_vertices()
-        mesh.remove_unreferenced_vertices()
+    exts = np.asarray(extrinsics, dtype=np.float64)
+    ixts = np.asarray(intrinsics, dtype=np.float64)
 
-    mesh.compute_vertex_normals()
+    if depth.ndim != 3:
+        raise ValueError(f"Expected DA3 depth shape N,H,W; got {depth.shape}")
+    if len(exts) != len(depth) or len(ixts) != len(depth):
+        raise ValueError("Depth/camera count mismatch in DA3 prediction.")
 
-    obj_path = output_dir / "multiview_mesh.obj"
-    stl_path = output_dir / "multiview_mesh.stl"
-    ply_path = output_dir / "multiview_mesh.ply"
-
-    # PLY/OBJ preserve vertex colors where supported; STL is geometry-only.
-    o3d.io.write_triangle_mesh(
-        str(obj_path), mesh, write_vertex_colors=True
+    valid_mask, conf_threshold = _prediction_confidence_mask(
+        prediction,
+        float(conf_thresh_percentile),
     )
-    o3d.io.write_triangle_mesh(str(stl_path), mesh)
-    o3d.io.write_triangle_mesh(
-        str(ply_path), mesh, write_vertex_colors=True
+    valid_depths = depth[valid_mask]
+    if len(valid_depths) < 100:
+        raise RuntimeError("Too few valid DA3 depth samples remained for TSDF fusion.")
+
+    median_depth = float(np.median(valid_depths))
+    depth_trunc = float(
+        np.percentile(valid_depths, float(tsdf_depth_trunc_percentile))
+    )
+    if not np.isfinite(median_depth) or median_depth <= 0:
+        raise RuntimeError("Could not derive a positive median scene depth for TSDF.")
+    if not np.isfinite(depth_trunc) or depth_trunc <= 0:
+        depth_trunc = float(np.max(valid_depths))
+
+    detail = max(32, int(tsdf_voxels_per_median_depth))
+    voxel_length = median_depth / float(detail)
+    sdf_trunc = voxel_length * max(1.0, float(tsdf_truncation_voxels))
+
+    volume = o3d.pipelines.integration.ScalableTSDFVolume(
+        voxel_length=float(voxel_length),
+        sdf_trunc=float(sdf_trunc),
+        color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
     )
 
-    mesh_tm = trimesh.load(str(obj_path), force="mesh", process=False)
+    integrated_views = 0
+    per_view_valid_pixels = []
 
-    # Gradio's browser Model3D renderer can make STL surfaces look misleadingly
-    # white/transparent because STL carries no material and browser renderers
-    # may cull backfaces or light them very differently from Windows 3D Viewer.
-    # Create a dedicated GLB preview with a neutral, rough, double-sided PBR
-    # material. This does NOT modify the printable STL/OBJ geometry.
-    preview_glb_path = output_dir / "multiview_mesh_preview.glb"
-    preview_tm = trimesh.Trimesh(
-        vertices=np.asarray(mesh.vertices),
-        faces=np.asarray(mesh.triangles),
-        process=False,
-    )
-    try:
-        preview_tm.fix_normals(multibody=True)
-    except Exception:
-        pass
+    for idx in range(len(depth)):
+        d = depth[idx].copy()
+        frame_valid = valid_mask[idx].copy()
+        frame_valid &= d <= depth_trunc
+        d[~frame_valid] = 0.0
 
-    preview_material = trimesh.visual.material.PBRMaterial(
-        name="neutral_preview",
-        baseColorFactor=[125, 125, 125, 255],
-        metallicFactor=0.0,
-        roughnessFactor=0.9,
-        doubleSided=True,
-    )
-    preview_tm.visual = trimesh.visual.TextureVisuals(
-        material=preview_material
-    )
-    trimesh.Scene(preview_tm).export(preview_glb_path)
+        valid_count = int(np.count_nonzero(frame_valid))
+        per_view_valid_pixels.append(valid_count)
+        if valid_count < 50:
+            continue
 
-    return {
-        "obj_path": obj_path,
-        "stl_path": stl_path,
-        "ply_path": ply_path,
-        "preview_glb_path": preview_glb_path,
-        "raw_ply_path": raw_ply_path,
-        "input_points": int(len(points)),
-        "filtered_points": int(len(pcd.points)),
-        "vertices": int(len(mesh.vertices)),
-        "triangles": int(len(mesh.triangles)),
-        "watertight": bool(mesh_tm.is_watertight),
-        "euler_number": int(mesh_tm.euler_number),
-    }
+        color = colors[idx]
+        h, w = d.shape
+        if color.shape[:2] != (h, w):
+            color = cv2.resize(
+                color,
+                (w, h),
+                interpolation=cv2.INTER_AREA,
+            )
+        color = np.ascontiguousarray(np.clip(color, 0, 255).astype(np.uint8))
+        d = np.ascontiguousarray(d.astype(np.float32))
+
+        k = ixts[idx]
+        intrinsic = o3d.camera.PinholeCameraIntrinsic(
+            int(w),
+            int(h),
+            float(k[0, 0]),
+            float(k[1, 1]),
+            float(k[0, 2]),
+            float(k[1, 2]),
+        )
+
+        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+            o3d.geometry.Image(color),
+            o3d.geometry.Image(d),
+            depth_scale=1.0,
+            depth_trunc=float(depth_trunc),
+            convert_rgb_to_intensity=False,
+        )
+
+        # DA3 documents extrinsics as OpenCV/COLMAP world-to-camera matrices,
+        # which is the convention Open3D's TSDF integrate() expects.
+        volume.integrate(
+            rgbd,
+            intrinsic,
+            _to_4x4_extrinsic(exts[idx]),
+        )
+        integrated_views += 1
+
+    if integrated_views < 2:
+        raise RuntimeError(
+            f"Only {integrated_views} views had enough valid depth for TSDF fusion."
+        )
+
+    mesh = volume.extract_triangle_mesh()
+    if len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
+        raise RuntimeError("TSDF fusion produced an empty mesh.")
+
+    mesh = _cleanup_open3d_mesh(
+        mesh,
+        keep_largest_component=bool(keep_largest_component),
+        smooth_iterations=int(smooth_iterations),
+        target_faces=int(target_faces),
+    )
+
+    extracted_pcd = volume.extract_point_cloud()
+    tsdf_pcd_path = output_dir / f"{prefix}_surface_point_cloud.ply"
+    o3d.io.write_point_cloud(str(tsdf_pcd_path), extracted_pcd)
+
+    exported = _export_open3d_mesh_bundle(mesh, output_dir, prefix)
+    exported.update(
+        {
+            "surface_point_cloud_path": tsdf_pcd_path,
+            "method": "TSDF",
+            "integrated_views": int(integrated_views),
+            "per_view_valid_pixels": per_view_valid_pixels,
+            "confidence_threshold": conf_threshold,
+            "median_depth": median_depth,
+            "depth_trunc": depth_trunc,
+            "voxel_length": float(voxel_length),
+            "sdf_trunc": float(sdf_trunc),
+        }
+    )
+    return exported
+
+
+def _mesh_result_files(result: dict) -> list[Path]:
+    keys = [
+        "raw_ply_path",
+        "surface_point_cloud_path",
+        "ply_path",
+        "obj_path",
+        "stl_path",
+        "preview_glb_path",
+    ]
+    return [Path(result[k]) for k in keys if result.get(k)]
+
+
+def _mesh_status_lines(label: str, result: dict) -> list[str]:
+    lines = [
+        f"#### {label}",
+        f"- **Vertices:** {result['vertices']:,}",
+        f"- **Triangles:** {result['triangles']:,}",
+        f"- **Watertight:** {'YES ✅' if result['watertight'] else 'NO ⚠️'}",
+        f"- **Euler number:** {result['euler_number']}",
+    ]
+    if result.get("method") == "Poisson":
+        lines.extend(
+            [
+                f"- **DA3 GLB points:** {result['input_points']:,}",
+                f"- **Points after cleanup:** {result['filtered_points']:,}",
+            ]
+        )
+    if result.get("method") == "TSDF":
+        lines.extend(
+            [
+                f"- **Views integrated:** {result['integrated_views']}",
+                f"- **Auto voxel length:** {result['voxel_length']:.6g}",
+                f"- **TSDF truncation:** {result['sdf_trunc']:.6g}",
+                f"- **Depth truncation:** {result['depth_trunc']:.6g}",
+            ]
+        )
+    return lines
 
 
 def build_multiview_mesh_core(
+    input_mode: str,
     multi_image_files,
+    video_file,
+    video_sample_fps: float,
+    colmap_dir_path: str,
+    colmap_sparse_subdir: str,
+    align_to_input_ext_scale: bool,
+    max_views: int,
     model_id: str,
     process_res: int,
+    auto_ref_strategy: bool,
     ref_view_strategy: str,
+    use_ray_pose: bool,
     conf_thresh_percentile: float,
     num_max_points: int,
+    reconstruction_mode: str,
+    tsdf_voxels_per_median_depth: int,
+    tsdf_truncation_voxels: float,
+    tsdf_depth_trunc_percentile: float,
     voxel_size: float,
     poisson_depth: int,
     trim_percentile: float,
@@ -1088,63 +1635,89 @@ def build_multiview_mesh_core(
     keep_largest_component: bool,
     progress=None,
 ):
-    image_paths = collect_uploaded_files(multi_image_files)
-
-    if len(image_paths) < 2:
+    if model_id not in MULTIVIEW_MODEL_IDS:
         raise ValueError(
-            "Upload at least 2 images of the same subject/scene for multi-view reconstruction."
-        )
-
-    if model_id not in {
-        "depth-anything/DA3-LARGE-1.1",
-        "depth-anything/DA3-GIANT-1.1",
-    }:
-        raise ValueError(
-            "Multi-view reconstruction is intended for DA3-Large-1.1 or DA3-Giant-1.1."
+            "Multi-view reconstruction requires DA3-Large-1.1, DA3-Giant-1.1, "
+            "or DA3Nested-Giant-Large-1.1."
         )
 
     job_dir = create_job_dir()
-    input_dir = job_dir / "multiview_inputs"
-    input_dir.mkdir(parents=True, exist_ok=True)
 
-    copied_images = []
-    for index, src in enumerate(image_paths):
-        if not src.exists():
-            raise FileNotFoundError(f"Uploaded image not found: {src}")
+    if progress:
+        progress(0.02, desc="Preparing / ordering multi-view inputs")
 
-        dst = input_dir / f"{index:03d}_{src.name}"
-        shutil.copy2(src, dst)
-        copied_images.append(dst)
+    (
+        copied_images,
+        input_extrinsics,
+        input_intrinsics,
+        source_kind,
+        source_meta,
+    ) = prepare_multiview_inputs(
+        input_mode=str(input_mode),
+        multi_image_files=multi_image_files,
+        video_file=video_file,
+        video_sample_fps=float(video_sample_fps),
+        colmap_dir_path=str(colmap_dir_path or ""),
+        colmap_sparse_subdir=str(colmap_sparse_subdir or ""),
+        max_views=int(max_views),
+        job_dir=job_dir,
+    )
+
+    input_order_path = job_dir / "multiview_input_order.txt"
+    input_order_path.write_text(
+        "\n".join(f"{idx:03d}  {path.name}" for idx, path in enumerate(copied_images))
+        + "\n",
+        encoding="utf-8",
+    )
+
+    if bool(auto_ref_strategy):
+        if source_kind in {"video", "ordered_frames"}:
+            effective_ref_strategy = "middle"
+        else:
+            effective_ref_strategy = "saddle_balanced"
+    else:
+        effective_ref_strategy = str(ref_view_strategy)
+
+    # Known COLMAP poses already condition the model; ray-pose estimation is for
+    # pose-free input, so it is intentionally disabled in this mode.
+    effective_use_ray_pose = bool(use_ray_pose) and input_extrinsics is None
 
     export_dir = job_dir / "da3_multiview"
     export_dir.mkdir(parents=True, exist_ok=True)
 
     if progress:
-        progress(0.05, desc="Loading multi-view DA3 model")
+        progress(0.08, desc="Loading multi-view DA3 model")
 
     model, device = get_model(model_id)
 
     if progress:
+        pose_desc = (
+            "known COLMAP poses"
+            if input_extrinsics is not None
+            else ("ray pose" if effective_use_ray_pose else "camera decoder")
+        )
         progress(
-            0.15,
+            0.14,
             desc=(
                 f"Running {MODEL_ID_TO_LABEL.get(model_id, model_id)} "
-                f"on {len(copied_images)} images"
+                f"on {len(copied_images)} views ({pose_desc})"
             ),
         )
 
     start = time.perf_counter()
 
-    # DA3's documented default for the any-view Large/Giant models is 504
-    # with upper_bound_resize. Higher values remain available experimentally,
-    # but 504 is intentionally the GUI default.
-    model.inference(
+    # One DA3 prediction is reused for both TSDF and Poisson in A/B mode.
+    prediction = model.inference(
         image=[str(p) for p in copied_images],
+        extrinsics=input_extrinsics,
+        intrinsics=input_intrinsics,
+        align_to_input_ext_scale=bool(align_to_input_ext_scale),
+        use_ray_pose=bool(effective_use_ray_pose),
         process_res=int(process_res),
         process_res_method="upper_bound_resize",
         export_dir=str(export_dir),
         export_format="mini_npz-glb",
-        ref_view_strategy=str(ref_view_strategy),
+        ref_view_strategy=str(effective_ref_strategy),
         conf_thresh_percentile=float(conf_thresh_percentile),
         num_max_points=int(num_max_points),
         show_cameras=False,
@@ -1157,126 +1730,270 @@ def build_multiview_mesh_core(
         raise FileNotFoundError(
             "DA3 multi-view inference completed but no GLB point-cloud export was found."
         )
-
     scene_glb = glb_candidates[0]
 
-    if progress:
-        progress(0.68, desc="Reconstructing surface from fused point cloud")
-
-    recon = reconstruct_poisson_mesh(
-        glb_path=scene_glb,
-        output_dir=job_dir,
-        voxel_size=float(voxel_size),
-        poisson_depth=int(poisson_depth),
-        trim_percentile=float(trim_percentile),
-        smooth_iterations=int(smooth_iterations),
-        target_faces=int(target_faces),
-        keep_largest_component=bool(keep_largest_component),
+    # Save explicit prediction arrays so an A/B run is reproducible without
+    # repeating inference if someone wants to inspect the raw DA3 geometry.
+    prediction_npz = job_dir / "da3_prediction_for_reconstruction.npz"
+    np.savez_compressed(
+        prediction_npz,
+        depth=np.asarray(prediction.depth),
+        conf=(
+            np.asarray(prediction.conf)
+            if getattr(prediction, "conf", None) is not None
+            else np.array([])
+        ),
+        extrinsics=(
+            np.asarray(prediction.extrinsics)
+            if getattr(prediction, "extrinsics", None) is not None
+            else np.array([])
+        ),
+        intrinsics=(
+            np.asarray(prediction.intrinsics)
+            if getattr(prediction, "intrinsics", None) is not None
+            else np.array([])
+        ),
+        sky=(
+            np.asarray(prediction.sky)
+            if getattr(prediction, "sky", None) is not None
+            else np.array([])
+        ),
     )
+
+    diag_glb, diag_json = create_camera_diagnostic_glb(
+        prediction=prediction,
+        output_dir=job_dir,
+        conf_thresh_percentile=float(conf_thresh_percentile),
+        num_max_points=int(num_max_points),
+    )
+
+    if progress:
+        progress(0.55, desc="Reconstructing surface mesh")
+
+    run_tsdf = reconstruction_mode in {
+        "TSDF (recommended)",
+        "A/B: TSDF + Poisson",
+    }
+    run_poisson = reconstruction_mode in {
+        "Poisson",
+        "A/B: TSDF + Poisson",
+    }
+
+    results = {}
+    errors = {}
+
+    if run_tsdf:
+        try:
+            results["tsdf"] = reconstruct_tsdf_mesh(
+                prediction=prediction,
+                output_dir=job_dir,
+                conf_thresh_percentile=float(conf_thresh_percentile),
+                tsdf_voxels_per_median_depth=int(tsdf_voxels_per_median_depth),
+                tsdf_truncation_voxels=float(tsdf_truncation_voxels),
+                tsdf_depth_trunc_percentile=float(tsdf_depth_trunc_percentile),
+                smooth_iterations=int(smooth_iterations),
+                target_faces=int(target_faces),
+                keep_largest_component=bool(keep_largest_component),
+                prefix=(
+                    "multiview_mesh"
+                    if reconstruction_mode == "TSDF (recommended)"
+                    else "multiview_tsdf"
+                ),
+            )
+        except Exception as exc:
+            errors["tsdf"] = f"{type(exc).__name__}: {exc}"
+            if reconstruction_mode == "TSDF (recommended)":
+                raise
+
+    if run_poisson:
+        try:
+            results["poisson"] = reconstruct_poisson_mesh(
+                glb_path=scene_glb,
+                output_dir=job_dir,
+                voxel_size=float(voxel_size),
+                poisson_depth=int(poisson_depth),
+                trim_percentile=float(trim_percentile),
+                smooth_iterations=int(smooth_iterations),
+                target_faces=int(target_faces),
+                keep_largest_component=bool(keep_largest_component),
+                prefix=(
+                    "multiview_mesh"
+                    if reconstruction_mode == "Poisson"
+                    else "multiview_poisson"
+                ),
+            )
+        except Exception as exc:
+            errors["poisson"] = f"{type(exc).__name__}: {exc}"
+            if reconstruction_mode == "Poisson":
+                raise
+
+    if not results:
+        raise RuntimeError(
+            "All requested reconstruction methods failed: "
+            + "; ".join(f"{k}: {v}" for k, v in errors.items())
+        )
+
+    # TSDF is primary whenever available because it directly fuses DA3 depth +
+    # camera geometry. Poisson remains available for controlled A/B comparison.
+    primary_key = "tsdf" if "tsdf" in results else "poisson"
+    secondary_key = None
+    if reconstruction_mode == "A/B: TSDF + Poisson" and len(results) > 1:
+        secondary_key = "poisson" if primary_key == "tsdf" else "tsdf"
 
     metadata = {
         "model": model_id,
         "model_label": MODEL_ID_TO_LABEL.get(model_id, model_id),
         "device": str(device),
-        "gpu": (
-            torch.cuda.get_device_name(0)
-            if torch.cuda.is_available()
-            else None
-        ),
+        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         "torch": torch.__version__,
         "torch_cuda": torch.version.cuda,
+        "source": source_meta,
         "image_count": len(copied_images),
-        "images": [p.name for p in copied_images],
+        "images_in_inference_order": [p.name for p in copied_images],
         "process_res": int(process_res),
         "process_res_method": "upper_bound_resize",
-        "ref_view_strategy": str(ref_view_strategy),
+        "auto_ref_strategy": bool(auto_ref_strategy),
+        "requested_ref_view_strategy": str(ref_view_strategy),
+        "effective_ref_view_strategy": str(effective_ref_strategy),
+        "requested_use_ray_pose": bool(use_ray_pose),
+        "effective_use_ray_pose": bool(effective_use_ray_pose),
+        "known_camera_poses": input_extrinsics is not None,
+        "align_to_input_ext_scale": bool(align_to_input_ext_scale),
         "conf_thresh_percentile": float(conf_thresh_percentile),
         "num_max_points": int(num_max_points),
-        "voxel_size": float(voxel_size),
-        "poisson_depth": int(poisson_depth),
-        "trim_percentile": float(trim_percentile),
-        "smooth_iterations": int(smooth_iterations),
-        "target_faces": int(target_faces),
-        "keep_largest_component": bool(keep_largest_component),
-        "inference_seconds": inference_seconds,
-        "mesh": {
-            "input_points": recon["input_points"],
-            "filtered_points": recon["filtered_points"],
-            "vertices": recon["vertices"],
-            "triangles": recon["triangles"],
-            "watertight": recon["watertight"],
-            "euler_number": recon["euler_number"],
+        "reconstruction_mode": str(reconstruction_mode),
+        "tsdf": {
+            "voxels_per_median_depth": int(tsdf_voxels_per_median_depth),
+            "truncation_voxels": float(tsdf_truncation_voxels),
+            "depth_trunc_percentile": float(tsdf_depth_trunc_percentile),
         },
+        "poisson": {
+            "voxel_downsample": float(voxel_size),
+            "poisson_depth": int(poisson_depth),
+            "trim_percentile": float(trim_percentile),
+        },
+        "postprocess": {
+            "smooth_iterations": int(smooth_iterations),
+            "target_faces": int(target_faces),
+            "keep_largest_component": bool(keep_largest_component),
+        },
+        "inference_seconds": inference_seconds,
+        "results": {
+            key: {
+                k: v
+                for k, v in result.items()
+                if not isinstance(v, Path)
+            }
+            for key, result in results.items()
+        },
+        "errors": errors,
     }
 
     metadata_path = job_dir / "multiview_metadata.json"
-    metadata_path.write_text(
-        json.dumps(metadata, indent=2),
-        encoding="utf-8",
-    )
+    metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    output_files = [scene_glb, prediction_npz, input_order_path, metadata_path]
+    if diag_glb is not None:
+        output_files.append(diag_glb)
+    if diag_json is not None:
+        output_files.append(diag_json)
+    for result in results.values():
+        output_files.extend(_mesh_result_files(result))
 
     if progress:
         progress(0.92, desc="Creating multi-view ZIP package")
 
     zip_path = job_dir / "DA3_multiview_mesh.zip"
-    with zipfile.ZipFile(
-        zip_path,
-        "w",
-        compression=zipfile.ZIP_DEFLATED,
-    ) as zf:
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for path in job_dir.rglob("*"):
             if path.is_file() and path != zip_path:
                 zf.write(path, arcname=path.relative_to(job_dir))
 
-    output_files = [
-        scene_glb,
-        recon["raw_ply_path"],
-        recon["ply_path"],
-        recon["obj_path"],
-        recon["stl_path"],
-        recon["preview_glb_path"],
-        metadata_path,
-    ]
-
     if progress:
         progress(1.0, desc="Multi-view reconstruction complete")
 
-    status = (
-        "### Multi-image reconstruction complete\n"
-        f"- **Model:** {MODEL_ID_TO_LABEL.get(model_id, model_id)} (`{model_id}`)\n"
-        f"- **Images:** {len(copied_images)}\n"
-        f"- **DA3 process resolution:** {int(process_res)}\n"
-        f"- **Reference strategy:** {ref_view_strategy}\n"
-        f"- **Inference:** {inference_seconds:.2f} s\n"
-        f"- **DA3 point-cloud points:** {recon['input_points']:,}\n"
-        f"- **Points after cleanup:** {recon['filtered_points']:,}\n"
-        f"- **Mesh vertices:** {recon['vertices']:,}\n"
-        f"- **Mesh triangles:** {recon['triangles']:,}\n"
-        f"- **Watertight:** {'YES ✅' if recon['watertight'] else 'NO ⚠️'}\n"
-        f"- **Euler number:** {recon['euler_number']}\n"
-        f"- **GPU:** {torch.cuda.get_device_name(0)}\n"
-        f"- **VRAM now:** {human_vram()}\n"
-        f"- **Output folder:** `{job_dir}`\n\n"
-        "The GLB is DA3's fused multi-view point cloud. The OBJ/PLY/STL are "
-        "surface reconstructions produced from that cloud with Poisson meshing."
+    status_lines = [
+        "### Multi-image reconstruction complete",
+        f"- **Input mode:** {input_mode}",
+        f"- **Model:** {MODEL_ID_TO_LABEL.get(model_id, model_id)} (`{model_id}`)",
+        f"- **Views used:** {len(copied_images)}",
+        f"- **DA3 process resolution:** {int(process_res)}",
+        f"- **Reference strategy:** {effective_ref_strategy}",
+        (
+            "- **Pose source:** known COLMAP cameras (pose-conditioned depth)"
+            if input_extrinsics is not None
+            else (
+                "- **Pose estimator:** ray head (quality mode)"
+                if effective_use_ray_pose
+                else "- **Pose estimator:** camera decoder (fast mode)"
+            )
+        ),
+        f"- **Inference:** {inference_seconds:.2f} s",
+        f"- **Reconstruction:** {reconstruction_mode}",
+        f"- **GPU:** {torch.cuda.get_device_name(0)}",
+        f"- **VRAM now:** {human_vram()}",
+        f"- **Output folder:** `{job_dir}`",
+        "",
+    ]
+
+    for key in ("tsdf", "poisson"):
+        if key in results:
+            status_lines.extend(_mesh_status_lines(results[key]["method"], results[key]))
+            status_lines.append("")
+        elif key in errors:
+            status_lines.extend(
+                [
+                    f"#### {key.upper()} failed",
+                    f"- `{errors[key]}`",
+                    "",
+                ]
+            )
+
+    status_lines.extend(
+        [
+            "**A/B note:** TSDF uses DA3's organized depth maps + confidence + intrinsics + "
+            "extrinsics directly. Poisson uses the exact same DA3 prediction after its GLB "
+            "point-cloud export, so `A/B: TSDF + Poisson` is a controlled mesher comparison.",
+            "",
+            "`camera_pose_diagnostic.glb` overlays camera centers/directions on DA3's point cloud "
+            "so a bad camera path can be distinguished from a bad surface reconstructor.",
+        ]
     )
 
     return {
-        "stl_path": recon["stl_path"],
-        "preview_glb_path": recon["preview_glb_path"],
-        "status": status,
+        "primary_preview": results[primary_key]["preview_glb_path"],
+        "secondary_preview": (
+            results[secondary_key]["preview_glb_path"]
+            if secondary_key is not None
+            else None
+        ),
+        "diagnostic_glb": diag_glb,
+        "status": "\n".join(status_lines),
         "files": output_files,
         "zip_path": zip_path,
     }
 
 
 def build_multiview_mesh_ui(
+    input_mode,
     multi_image_files,
+    video_file,
+    video_sample_fps,
+    colmap_dir_path,
+    colmap_sparse_subdir,
+    align_to_input_ext_scale,
+    max_views,
     model_id,
     process_res,
+    auto_ref_strategy,
     ref_view_strategy,
+    use_ray_pose,
     conf_thresh_percentile,
     num_max_points,
+    reconstruction_mode,
+    tsdf_voxels_per_median_depth,
+    tsdf_truncation_voxels,
+    tsdf_depth_trunc_percentile,
     voxel_size,
     poisson_depth,
     trim_percentile,
@@ -1286,12 +2003,25 @@ def build_multiview_mesh_ui(
     progress=gr.Progress(),
 ):
     result = build_multiview_mesh_core(
+        input_mode=str(input_mode),
         multi_image_files=multi_image_files,
+        video_file=video_file,
+        video_sample_fps=float(video_sample_fps),
+        colmap_dir_path=str(colmap_dir_path or ""),
+        colmap_sparse_subdir=str(colmap_sparse_subdir or ""),
+        align_to_input_ext_scale=bool(align_to_input_ext_scale),
+        max_views=int(max_views),
         model_id=str(model_id),
         process_res=int(process_res),
+        auto_ref_strategy=bool(auto_ref_strategy),
         ref_view_strategy=str(ref_view_strategy),
+        use_ray_pose=bool(use_ray_pose),
         conf_thresh_percentile=float(conf_thresh_percentile),
         num_max_points=int(num_max_points),
+        reconstruction_mode=str(reconstruction_mode),
+        tsdf_voxels_per_median_depth=int(tsdf_voxels_per_median_depth),
+        tsdf_truncation_voxels=float(tsdf_truncation_voxels),
+        tsdf_depth_trunc_percentile=float(tsdf_depth_trunc_percentile),
         voxel_size=float(voxel_size),
         poisson_depth=int(poisson_depth),
         trim_percentile=float(trim_percentile),
@@ -1302,12 +2032,21 @@ def build_multiview_mesh_ui(
     )
 
     return (
-        str(result["preview_glb_path"]),
+        str(result["primary_preview"]),
+        (
+            str(result["secondary_preview"])
+            if result["secondary_preview"] is not None
+            else None
+        ),
+        (
+            str(result["diagnostic_glb"])
+            if result["diagnostic_glb"] is not None
+            else None
+        ),
         result["status"],
         [str(p) for p in result["files"]],
         str(result["zip_path"]),
     )
-
 
 def build_mesh_core(
     job_dir_value,
@@ -2008,15 +2747,33 @@ with gr.Blocks(css=CSS, title="DA3 Depth / Multi-View → Printable 3D") as demo
 
         with gr.Tab("Multi-Image 3D"):
             gr.Markdown(
-                "Use **DA3-Large-1.1** or **DA3-Giant-1.1** with multiple overlapping "
-                "views of the **same subject or scene**. DA3 estimates a mutually consistent "
-                "multi-view point cloud, then this GUI converts it to OBJ/PLY/STL."
+                "Use DA3's **any-view** models for multiple overlapping views of the same "
+                "subject/scene. For best-quality reconstruction this tab now supports "
+                "**ray-based pose estimation**, direct **video sampling**, **known COLMAP "
+                "camera poses**, direct **TSDF fusion**, the legacy **Poisson** path, and a "
+                "controlled **TSDF vs Poisson A/B** run from the exact same DA3 prediction."
             )
 
             with gr.Row():
                 with gr.Column(scale=5):
+                    input_mode = gr.Dropdown(
+                        choices=[
+                            "Unordered uploaded photos",
+                            "Ordered uploaded frames",
+                            "Video file",
+                            "COLMAP local dataset (known poses)",
+                        ],
+                        value="Unordered uploaded photos",
+                        label="Multi-view input mode",
+                        info=(
+                            "Use Ordered uploaded frames for frames already extracted from a video. "
+                            "Use Video file to let the app sample frames itself. COLMAP enables "
+                            "pose-conditioned depth from known camera intrinsics/extrinsics."
+                        ),
+                    )
+
                     multi_image_files = gr.File(
-                        label="Input images (2 or more)",
+                        label="Uploaded photos / ordered frames",
                         file_count="multiple",
                         type="filepath",
                         file_types=[
@@ -2025,11 +2782,71 @@ with gr.Blocks(css=CSS, title="DA3 Depth / Multi-View → Printable 3D") as demo
                         ],
                     )
 
+                    video_file = gr.File(
+                        label="Optional source video",
+                        file_count="single",
+                        type="filepath",
+                        file_types=[
+                            ".mp4", ".avi", ".mov", ".mkv",
+                            ".flv", ".wmv", ".webm", ".m4v",
+                        ],
+                    )
+
+                    video_sample_fps = gr.Number(
+                        value=1.0,
+                        label="Video sampling FPS",
+                        info=(
+                            "1.0 FPS is DA3's documented CLI default. Increase if camera motion is "
+                            "fast; decrease if adjacent samples have too little viewpoint change."
+                        ),
+                    )
+
+                    with gr.Accordion("COLMAP / known-camera input", open=False):
+                        colmap_dir_path = gr.Textbox(
+                            value="",
+                            label="Local COLMAP dataset folder",
+                            placeholder=r"D:\path\to\dataset",
+                            info=(
+                                "Local path on this computer. The folder must contain images/ and "
+                                "sparse/. This uses DA3's own COLMAP input handler."
+                            ),
+                        )
+                        colmap_sparse_subdir = gr.Textbox(
+                            value="",
+                            label="COLMAP sparse subdirectory",
+                            placeholder="0",
+                            info=(
+                                "Leave blank when cameras/images are directly under sparse/. "
+                                "Enter 0 for the common sparse/0/ layout."
+                            ),
+                        )
+                        align_to_input_ext_scale = gr.Checkbox(
+                            value=True,
+                            label="Align DA3 depth to COLMAP camera scale",
+                            info=(
+                                "Matches DA3's documented align_to_input_ext_scale=True behavior."
+                            ),
+                        )
+
+                    max_views = gr.Dropdown(
+                        choices=[0, 4, 6, 8, 12, 18],
+                        value=18,
+                        label="Maximum views (0 = no limit)",
+                        info=(
+                            "DA3 training at the 504 base resolution used 2–18 views. The default "
+                            "caps long videos/large sets at 18 and samples them evenly."
+                        ),
+                    )
+
                     multiview_model_id = gr.Dropdown(
                         choices=[
                             (
-                                "DA3-Giant-1.1 (best quality candidate)",
+                                "DA3-Giant-1.1 (quality any-view)",
                                 "depth-anything/DA3-GIANT-1.1",
+                            ),
+                            (
+                                "DA3Nested-Giant-Large-1.1 (metric-scale nested)",
+                                "depth-anything/DA3NESTED-GIANT-LARGE-1.1",
                             ),
                             (
                                 "DA3-Large-1.1 (lighter/faster)",
@@ -2039,8 +2856,8 @@ with gr.Blocks(css=CSS, title="DA3 Depth / Multi-View → Printable 3D") as demo
                         value="depth-anything/DA3-GIANT-1.1",
                         label="Multi-view DA3 model",
                         info=(
-                            "Giant is the default quality choice. Large is useful "
-                            "when you want lower VRAM use or faster iteration."
+                            "Giant is the default quality choice. Nested adds metric scaling. "
+                            "Large is useful for lower VRAM use / faster iteration."
                         ),
                     )
 
@@ -2049,27 +2866,46 @@ with gr.Blocks(css=CSS, title="DA3 Depth / Multi-View → Printable 3D") as demo
                         value=504,
                         label="DA3 multi-view process resolution",
                         info=(
-                            "504 is the documented DA3 default and the recommended "
-                            "starting point for Large/Giant. Higher values are experimental."
+                            "504 is DA3's documented default/base regime and is the recommended "
+                            "starting point for Giant/Large. Higher values remain experimental."
                         ),
                     )
 
-                    ref_view_strategy = gr.Dropdown(
-                        choices=[
-                            "saddle_balanced",
-                            "saddle_sim_range",
-                            "middle",
-                        ],
-                        value="saddle_balanced",
-                        label="Reference-view strategy",
-                        info=(
-                            "saddle_balanced: general unordered photos; "
-                            "saddle_sim_range: wider-baseline photos; "
-                            "middle: ordered sequence/video-like captures."
-                        ),
-                    )
+                    with gr.Accordion("Pose estimation / reference view", open=True):
+                        use_ray_pose = gr.Checkbox(
+                            value=True,
+                            label="Use high-quality ray-based camera pose estimation",
+                            info=(
+                                "DA3 documents use_ray_pose=True as slightly slower but generally "
+                                "more accurate. Automatically ignored when known COLMAP poses are supplied."
+                            ),
+                        )
 
-                    with gr.Accordion("DA3 point-cloud quality", open=False):
+                        auto_ref_strategy = gr.Checkbox(
+                            value=True,
+                            label="Automatically choose reference strategy from input type",
+                            info=(
+                                "Ordered frames/video -> middle. Unordered photos -> saddle_balanced. "
+                                "Uncheck to force the manual strategy below."
+                            ),
+                        )
+
+                        ref_view_strategy = gr.Dropdown(
+                            choices=[
+                                "saddle_balanced",
+                                "saddle_sim_range",
+                                "middle",
+                                "first",
+                            ],
+                            value="saddle_balanced",
+                            label="Manual reference-view strategy",
+                            info=(
+                                "saddle_balanced: general photos; saddle_sim_range: wider-baseline sets; "
+                                "middle: ordered/video sequence; first: supported by DA3 but generally not recommended."
+                            ),
+                        )
+
+                    with gr.Accordion("DA3 point-cloud / confidence quality", open=False):
                         conf_thresh_percentile = gr.Slider(
                             0.0,
                             80.0,
@@ -2077,8 +2913,8 @@ with gr.Blocks(css=CSS, title="DA3 Depth / Multi-View → Printable 3D") as demo
                             step=1.0,
                             label="Confidence filter percentile",
                             info=(
-                                "40 is DA3's documented GLB default. Raise it to "
-                                "remove more uncertain points; lower it to preserve more geometry."
+                                "40 is DA3's documented GLB default. TSDF uses the same percentile "
+                                "to mask low-confidence depth for a fair A/B comparison."
                             ),
                         )
 
@@ -2091,20 +2927,68 @@ with gr.Blocks(css=CSS, title="DA3 Depth / Multi-View → Printable 3D") as demo
                                 1000000,
                             ],
                             value=1000000,
-                            label="Maximum fused points",
+                            label="Maximum DA3 GLB points",
                             info=(
-                                "1,000,000 is DA3's documented GLB default and preserves "
-                                "the most detail, at the cost of more CPU/RAM during meshing."
+                                "1,000,000 is DA3's documented GLB default. This affects the Poisson "
+                                "path/diagnostic cloud; TSDF fuses DA3 depth maps directly."
                             ),
                         )
 
-                    with gr.Accordion("Surface reconstruction", open=False):
+                    reconstruction_mode = gr.Dropdown(
+                        choices=[
+                            "TSDF (recommended)",
+                            "A/B: TSDF + Poisson",
+                            "Poisson",
+                        ],
+                        value="TSDF (recommended)",
+                        label="Surface reconstruction method",
+                        info=(
+                            "TSDF directly fuses DA3 depth + confidence + camera intrinsics/extrinsics. "
+                            "A/B runs TSDF and Poisson from one inference so the comparison is controlled."
+                        ),
+                    )
+
+                    with gr.Accordion("TSDF quality settings", open=False):
+                        tsdf_voxels_per_median_depth = gr.Dropdown(
+                            choices=[128, 192, 256, 384, 512],
+                            value=256,
+                            label="TSDF detail (voxels per median scene depth)",
+                            info=(
+                                "Higher = smaller voxels / more detail / more RAM and CPU time. "
+                                "256 is the quality-oriented starting point."
+                            ),
+                        )
+
+                        tsdf_truncation_voxels = gr.Slider(
+                            2.0,
+                            10.0,
+                            value=5.0,
+                            step=0.5,
+                            label="TSDF truncation distance (voxels)",
+                            info=(
+                                "Controls how far around each observed surface the signed-distance "
+                                "field is integrated. 4–6 voxels is a useful starting range."
+                            ),
+                        )
+
+                        tsdf_depth_trunc_percentile = gr.Slider(
+                            90.0,
+                            100.0,
+                            value=99.5,
+                            step=0.1,
+                            label="Ignore farthest depth outliers above percentile",
+                            info=(
+                                "Protects TSDF scale from extreme far-depth/sky outliers. Sky pixels "
+                                "are also removed automatically when DA3 provides a sky mask."
+                            ),
+                        )
+
+                    with gr.Accordion("Poisson A/B settings", open=False):
                         voxel_size = gr.Number(
                             value=0.0,
-                            label="Voxel downsample size (0 = off)",
+                            label="Poisson point-cloud voxel downsample (0 = off)",
                             info=(
-                                "Leave at 0 for maximum detail. If a huge/noisy cloud is "
-                                "slow, use a small value relative to the scene scale."
+                                "Leave at 0 for maximum detail. Increase slightly only for huge/noisy clouds."
                             ),
                         )
 
@@ -2113,8 +2997,7 @@ with gr.Blocks(css=CSS, title="DA3 Depth / Multi-View → Printable 3D") as demo
                             value=9,
                             label="Poisson reconstruction depth",
                             info=(
-                                "9 is a quality-oriented starting point. Higher values can "
-                                "retain more detail but can also amplify noise and use much more RAM."
+                                "Higher can retain more point-cloud detail but can amplify noise and use more RAM."
                             ),
                         )
 
@@ -2123,23 +3006,20 @@ with gr.Blocks(css=CSS, title="DA3 Depth / Multi-View → Printable 3D") as demo
                             10.0,
                             value=0.0,
                             step=0.25,
-                            label="Trim lowest-density vertices (%)",
+                            label="Trim lowest-density Poisson vertices (%)",
                             info=(
-                                "0 preserves the closed Poisson surface. Try 1–3 only if "
-                                "you see weak skirts or unsupported geometry around the object."
+                                "0 preserves the full Poisson result. Try 1–3 only for weak skirts/debris."
                             ),
                         )
 
+                    with gr.Accordion("Shared mesh post-processing", open=False):
                         smooth_iterations = gr.Slider(
                             0,
                             20,
                             value=3,
                             step=1,
                             label="Taubin smoothing iterations",
-                            info=(
-                                "A small amount can suppress point-cloud roughness without "
-                                "destroying detail. Increase cautiously."
-                            ),
+                            info="Applied equally to whichever mesh reconstructor(s) you run.",
                         )
 
                         target_faces = gr.Dropdown(
@@ -2147,8 +3027,7 @@ with gr.Blocks(css=CSS, title="DA3 Depth / Multi-View → Printable 3D") as demo
                             value=400000,
                             label="Target triangle count (0 = full mesh)",
                             info=(
-                                "400k preserves substantial detail while staying manageable. "
-                                "Use 0 to keep the full Poisson mesh."
+                                "400k is a substantial-detail default. Use 0 for raw/full mesh comparison."
                             ),
                         )
 
@@ -2159,15 +3038,29 @@ with gr.Blocks(css=CSS, title="DA3 Depth / Multi-View → Printable 3D") as demo
                         )
 
                     multiview_btn = gr.Button(
-                        "Reconstruct Multi-Image Mesh",
+                        "Run Multi-View Reconstruction",
                         variant="primary",
                     )
 
                 with gr.Column(scale=5):
                     multiview_model_viewer = gr.Model3D(
-                        label="Multi-view mesh preview (GLB / double-sided neutral material)",
+                        label="Primary mesh preview (TSDF when available)",
                         display_mode="solid",
-                        height=650,
+                        height=520,
+                        interactive=False,
+                    )
+
+                    multiview_compare_viewer = gr.Model3D(
+                        label="A/B comparison preview (Poisson in A/B mode)",
+                        display_mode="solid",
+                        height=420,
+                        interactive=False,
+                    )
+
+                    multiview_camera_viewer = gr.Model3D(
+                        label="DA3 camera-pose diagnostic (point cloud + camera directions)",
+                        display_mode="solid",
+                        height=420,
                         interactive=False,
                     )
 
@@ -2205,11 +3098,14 @@ with gr.Blocks(css=CSS, title="DA3 Depth / Multi-View → Printable 3D") as demo
 You can rebuild the mesh repeatedly with different Z scale, base thickness, grid density, inversion, horizontal orientation correction, normalization, or **Depth Curve / foreground emphasis** **without rerunning the neural network**. The depth curve smoothly compresses background depth while reserving more physical Z range for foreground detail. You can also bypass DA3 entirely and upload an external depth EXR/PNG/NPY/TIFF for comparison.
 
 **Multi-image 3D stage**
-1. Upload overlapping photographs of the same subject/scene.
-2. Start with **DA3-Giant-1.1 at 504**.
-3. DA3 jointly estimates depth/camera geometry and exports a fused GLB point cloud.
-4. The GUI filters that cloud and runs Poisson surface reconstruction.
-5. It exports the DA3 GLB, raw point cloud, OBJ, PLY, STL, metadata, and a ZIP package.
+1. Choose unordered photos, naturally sorted ordered frames, a source video, or a local COLMAP dataset with known poses.
+2. Start with **DA3-Giant-1.1 at 504**; **DA3Nested-Giant-Large-1.1** is also available when metric scaling is useful.
+3. For pose-free images, high-quality **ray-based pose estimation** is enabled by default. Ordered frames/video automatically use the **middle** reference view; unordered photos use **saddle_balanced** unless you override it.
+4. Direct video input uses DA3's own video sampling behavior with **1 FPS** as the documented default. Inputs are capped at 18 views by default and sampled evenly when necessary.
+5. **TSDF** is the recommended mesh path and directly fuses DA3 depth + confidence + intrinsics + extrinsics. **Poisson** remains available, and **A/B: TSDF + Poisson** runs both from the same DA3 prediction.
+6. A diagnostic GLB overlays predicted camera centers/directions on DA3's point cloud so camera-pose problems can be separated from meshing problems.
+7. COLMAP mode uses known camera intrinsics/extrinsics for DA3 pose-conditioned depth estimation.
+8. The job exports DA3's GLB/NPZ geometry, camera diagnostics, reconstructed OBJ/PLY/STL/preview GLBs, metadata, and a ZIP package.
 
 ### Printing note
 
@@ -2345,12 +3241,25 @@ STL stores geometry but no physical unit. Most slicers interpret STL coordinates
     multiview_btn.click(
         fn=build_multiview_mesh_ui,
         inputs=[
+            input_mode,
             multi_image_files,
+            video_file,
+            video_sample_fps,
+            colmap_dir_path,
+            colmap_sparse_subdir,
+            align_to_input_ext_scale,
+            max_views,
             multiview_model_id,
             multiview_process_res,
+            auto_ref_strategy,
             ref_view_strategy,
+            use_ray_pose,
             conf_thresh_percentile,
             num_max_points,
+            reconstruction_mode,
+            tsdf_voxels_per_median_depth,
+            tsdf_truncation_voxels,
+            tsdf_depth_trunc_percentile,
             voxel_size,
             poisson_depth,
             trim_percentile,
@@ -2360,6 +3269,8 @@ STL stores geometry but no physical unit. Most slicers interpret STL coordinates
         ],
         outputs=[
             multiview_model_viewer,
+            multiview_compare_viewer,
+            multiview_camera_viewer,
             multiview_status,
             multiview_files,
             multiview_zip,
