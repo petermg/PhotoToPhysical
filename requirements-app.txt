@@ -1,6 +1,16 @@
-# Direct dependencies used by the custom Gradio application.
+# Direct dependencies used by the PhotoToPhysical Gradio application.
+#
 # PyTorch / torchvision / xformers are intentionally installed separately
 # from the PyTorch CUDA 12.8 index; see INSTALL_WINDOWS_NVIDIA.txt.
+#
+# Depth Anything 3 is intentionally installed from the pinned upstream commit
+# documented in README.md / INSTALL_WINDOWS_NVIDIA.txt.
+#
+# Optional components are intentionally NOT included here:
+# - gsplat: only needed for DA3 Gaussian preview-video rendering; source-built
+#   using the exact DA3-pinned commit and --no-build-isolation.
+# - OpenMVS: external executable backend.
+# - 2DGS: separate external Python/CUDA environment.
 
 gradio==6.25.0
 numpy==1.26.4

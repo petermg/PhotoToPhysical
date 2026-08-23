@@ -1,6 +1,12 @@
 KNOWN-GOOD ENVIRONMENT SNAPSHOT
 ===============================
 
+PhotoToPhysical repository:
+    https://github.com/petermg/PhotoToPhysical
+
+Core tested environment
+-----------------------
+
 Python:
     Python 3.10.6
 
@@ -21,6 +27,65 @@ Application dependencies:
     Pillow==12.3.0
     trimesh==5.0.0
 
-The full observed environment is available from the accompanying
-pip freeze / pip list captures if an exact transitive dependency snapshot
-is needed for troubleshooting.
+Confirmed core capabilities
+---------------------------
+
+- CUDA DA3 inference
+- single-image DA3 depth workflow
+- external depth-map mesh workflow
+- printable OBJ/STL relief generation
+- multi-image/video DA3 any-view inference
+- DA3 fused GLB point-cloud output
+- TSDF mesh path
+- Poisson mesh path
+- Consistent Surfel + Poisson path integrated in the current script
+- camera-pose diagnostics
+- native DA3 Gaussian PLY export integrated for Giant/Nested Giant-Large
+
+Optional components NOT part of the core known-good environment
+---------------------------------------------------------------
+
+1. gsplat renderer
+
+   DA3 pins:
+       git+https://github.com/nerfstudio-project/gsplat.git@0b4dddf04cb687367602c01196913cde6a743d70
+
+   Purpose:
+       Gaussian preview-video rendering / rasterization.
+
+   Native Gaussian PLY export does not require gsplat.
+
+   A normal isolated pip source build was observed to fail because the temporary
+   build environment did not contain torch. The upstream-recommended install is:
+
+       python -m pip install --no-build-isolation git+https://github.com/nerfstudio-project/gsplat.git@0b4dddf04cb687367602c01196913cde6a743d70
+
+   A complete known-good Windows gsplat build has not yet been established for
+   this PhotoToPhysical environment.
+
+2. OpenMVS
+
+   Integrated as an external executable backend. Not included in the Python
+   environment snapshot.
+
+3. 2D Gaussian Splatting / 2DGS
+
+   Integrated as an external backend and intended to run in a separate Python /
+   CUDA environment. Not included in the core snapshot.
+
+Reproducibility
+---------------
+
+When troubleshooting, capture:
+
+    python --version
+    python -m pip freeze
+    git --version
+    nvidia-smi
+
+and:
+
+    python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)"
+
+Do not casually change the pinned DA3 revision or the core PyTorch/xFormers stack
+while debugging unrelated reconstruction issues.

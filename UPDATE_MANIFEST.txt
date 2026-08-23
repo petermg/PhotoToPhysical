@@ -1,0 +1,16 @@
+PhotoToPhysical repository documentation update
+
+Replace/add these files at the repository root:
+
+- README.md
+- INSTALL_WINDOWS_NVIDIA.txt
+- INSTALL_MULTIVIEW_BACKENDS.md
+- MULTIVIEW_TESTING.md
+- KNOWN_GOOD_ENVIRONMENT.txt
+- THIRD_PARTY_NOTICES.txt
+- requirements-app.txt
+
+This package updates repository documentation to match the current
+da3_print_gui_v2.py feature set, including Consistent Surfel, OpenMVS, 2DGS,
+native DA3 Gaussian PLY output, optional gsplat video rendering, and corrected
+video-sampling / Maximum Views semantics.

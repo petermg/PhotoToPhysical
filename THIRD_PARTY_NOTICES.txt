@@ -1,24 +1,109 @@
 THIRD-PARTY SOFTWARE / MODEL NOTICE
 ===================================
 
-This project uses Depth Anything 3 by ByteDance-Seed:
-https://github.com/ByteDance-Seed/Depth-Anything-3
+PhotoToPhysical integrates with third-party software, libraries, and model
+checkpoints. Those projects retain their own copyrights and licenses.
 
-The application installs a pinned upstream revision:
-3d835ec1a5802d64a8b8b15f817a1ab54809bfe4
+This notice is informational and is not a substitute for reviewing the complete
+upstream license text before redistribution, hosted services, or commercial use.
 
-The upstream DA3 source code is published under Apache-2.0.
+DEPTH ANYTHING 3
+----------------
 
-Model checkpoints have their own licenses. According to the upstream DA3
-model table at the time this notice was prepared:
+Project:
+    Depth Anything 3 by ByteDance-Seed
 
-- depth-anything/DA3MONO-LARGE: Apache-2.0
-- depth-anything/DA3-LARGE-1.1: CC BY-NC 4.0
-- depth-anything/DA3-GIANT-1.1: CC BY-NC 4.0
-- depth-anything/DA3NESTED-GIANT-LARGE-1.1: CC BY-NC 4.0
+Repository:
+    https://github.com/ByteDance-Seed/Depth-Anything-3
 
-This repository should not redistribute those model weights unless their
-individual license terms are satisfied. The application downloads models
-from Hugging Face at runtime.
+Pinned PhotoToPhysical revision:
+    3d835ec1a5802d64a8b8b15f817a1ab54809bfe4
 
-Other Python packages are distributed under their respective licenses.
+Source-code license:
+    Apache License 2.0
+
+MODEL CHECKPOINTS
+-----------------
+
+According to the upstream DA3 model table at the time this notice was prepared:
+
+- depth-anything/DA3MONO-LARGE
+    Apache-2.0
+
+- depth-anything/DA3-LARGE-1.1
+    CC BY-NC 4.0
+
+- depth-anything/DA3-GIANT-1.1
+    CC BY-NC 4.0
+
+- depth-anything/DA3NESTED-GIANT-LARGE-1.1
+    CC BY-NC 4.0
+
+Model weights are not redistributed by PhotoToPhysical. The application obtains
+models from Hugging Face / the configured local cache at runtime.
+
+Review each current upstream model card before redistribution or commercial use.
+
+GSPLAT
+------
+
+Project:
+    nerfstudio-project/gsplat
+
+Repository:
+    https://github.com/nerfstudio-project/gsplat
+
+DA3-pinned revision used for optional Gaussian rendering:
+    0b4dddf04cb687367602c01196913cde6a743d70
+
+License:
+    Apache License 2.0
+
+PhotoToPhysical does not redistribute gsplat. It is an optional dependency used
+by DA3 for rasterized Gaussian preview-video rendering. Native DA3 Gaussian PLY
+export can be used without installing gsplat.
+
+OPENMVS
+-------
+
+Project:
+    OpenMVS
+
+Repository:
+    https://github.com/cdcseacave/openMVS
+
+License:
+    GNU Affero General Public License v3 (AGPL-3.0)
+
+PhotoToPhysical treats OpenMVS as an optional external executable backend and
+does not redistribute OpenMVS binaries in this repository.
+
+Users who distribute, modify, or expose OpenMVS-based software/services should
+review the complete AGPL-3.0 requirements directly from upstream.
+
+2D GAUSSIAN SPLATTING / 2DGS
+----------------------------
+
+Project:
+    2D Gaussian Splatting for Geometrically Accurate Radiance Fields
+
+Repository:
+    https://github.com/hbb1/2d-gaussian-splatting
+
+Upstream license file:
+    LICENSE.md / Gaussian-Splatting License
+
+The upstream license grants non-commercial research/evaluation use and states
+that commercial use requires prior explicit consent from the licensors.
+
+PhotoToPhysical does not redistribute the 2DGS repository. Integration expects a
+separate user-installed checkout/environment.
+
+OTHER PYTHON PACKAGES
+---------------------
+
+PhotoToPhysical also uses packages such as PyTorch, torchvision, xFormers,
+Gradio, NumPy, Open3D, OpenCV, Pillow, trimesh, and packages pulled by the pinned
+DA3 installation. Each remains subject to its own upstream license.
+
+No third-party model license is changed by PhotoToPhysical's integration.
